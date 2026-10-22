@@ -120,7 +120,10 @@ def transcribe(
                 torch.cuda.synchronize()
                 start = time.time()
 
-            frame_tensor = torch.from_numpy(frame).pin_memory()
+            frame_tensor = torch.from_numpy(frame)
+            if torch.cuda.is_available():
+                frame_tensor = frame_tensor.pin_memory()
+    
             mel_frame = streamed_spectrogram.calc_mel_with_new_frame(frame_tensor.to(model.device, non_blocking=True))
             
             # decode given the new mel frame and print results
