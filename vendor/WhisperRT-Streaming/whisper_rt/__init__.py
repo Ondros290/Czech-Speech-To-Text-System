@@ -301,7 +301,7 @@ def load_streaming_model(
     print(f"Loading streaming model from {ckpt_path}...")
 
     try:        
-        checkpoint = torch.load(ckpt_path, weights_only=False)
+        checkpoint = torch.load(ckpt_path, weights_only=False,map_location=device)
     except FileNotFoundError as e:
         raise RuntimeError(f"Could not find the checkpoint at {ckpt_path}.") from e
 
