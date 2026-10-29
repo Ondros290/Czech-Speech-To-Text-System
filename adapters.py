@@ -5,8 +5,6 @@ Two kinds:
   * offline + policy  : Whisper, wav2vec 2.0, Parakeet-TDT, wrapped by the SAME
                         re-decode policy (ReDecodeAdapter, LocalAgreement-2)
 
-For offline models you are benchmarking the model AND the streaming policy.
-Say so in the thesis, and report the policy parameters (step_ms, agreement).
 """
 from __future__ import annotations
 
