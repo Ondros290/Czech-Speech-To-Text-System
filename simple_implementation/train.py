@@ -2,19 +2,22 @@ import torch
 import torch.nn as nn
 import argparse
 import random
-
+from pathlib import Path
+import json, time
 from data import CzechSpeechDS
 from data import LogMelFeaturizer
 from data import collate_function
 from model import Decoder
-from model import CNN
+from model import CNN, Transformer
 from torch.utils.data import DataLoader, Subset
+from datetime import datetime
+
 
 from data import N_MELS, BLANK_ID
 
 class Trainer:
-    def __init__(self, model, vocab, epochs, lr, train_loader,val_loader=None, *, weight_decay=1e-2, warmup_frac=0.15,
-                 grad_clip=5.0, device="cpu", last_path = "last.pt", ckpt_path="best.pt", blank = BLANK_ID,
+    def __init__(self, model, vocab, epochs, lr, train_loader, run_name, val_loader, *, weight_decay=1e-2, warmup_frac=0.15,
+                 grad_clip=5.0, device="cpu", blank = BLANK_ID,
                  evaluator=None):
 
         self.device = device
@@ -25,8 +28,7 @@ class Trainer:
         self.vocab = vocab
         
         self.best_score = float("inf")
-        self.start_epoch = 0                  # 0 = fresh run; set by load(resume=True)
-        self.last_path = last_path 
+        self.start_epoch = 0                  # 0 = fresh run; set by load(resume=True) 
         
         self.train_loader = train_loader
         self.decoder = Decoder(vocab)
@@ -38,8 +40,20 @@ class Trainer:
         self.warmup_frac = warmup_frac
         self.grad_clip = grad_clip
         self.blank = blank
-        self.ckpt_path = ckpt_path
         self.evaluator = evaluator
+        
+        self.run_dir = Path("runs") / run_name
+        self.ckpt_path = self.run_dir / "best.pt"
+        self.last_path = self.run_dir/"last.pt"
+        self.log = MetricLogger(self.run_dir, config={
+            "model": type(model).__name__,
+            "params": sum(p.numel() for p in model.parameters()),
+            "epochs": epochs, "lr": lr, "weight_decay": weight_decay,
+            "warmup_frac": warmup_frac, "grad_clip": grad_clip,
+            "batch_size": train_loader.batch_size,
+            "n_train": len(train_loader.dataset),
+            "vocab_size": len(vocab),
+        })
 
         self.ctc = nn.CTCLoss(blank, zero_infinity=True)
         
@@ -53,7 +67,7 @@ class Trainer:
         # pct start =  The percentage of the cycle (in number of steps) spent increasing the learning rate.
          
 
-    def train_epoch(self, epoch):
+    def train_epoch(self, epoch, t0):
         
         self.model.train()
         total = 0.0
@@ -85,11 +99,15 @@ class Trainer:
             self.sched.step()
             total += loss.item()
             
-        avg_loss = total / max(n_ok, 1)
-        print(f"epoch {epoch}  train CTC loss {avg_loss:.3f} | "
-          f"infeasible clips {n_infeasible} | skipped batches {n_skipped}")
-        
-        return avg_loss
+        stats = {
+            "train_loss": total / max(n_ok, 1),
+            "lr": self.sched.get_last_lr()[0],
+            "infeasible": n_infeasible,
+            "skipped": n_skipped,
+            "seconds": time.time() - t0,
+        }
+        print(f"epoch {epoch}  train CTC loss {stats['train_loss']:.3f}")
+        return stats
         
 
     @torch.no_grad()
@@ -140,7 +158,7 @@ class Trainer:
         }
         
         print(f"val_loss: {metrics['val_loss']:.4f} | WER: {metrics['wer']:.2%}| CER: {metrics['cer']:.2%}  | infeasible clips {n_infeasible} | skipped batches {n_skipped}")
-        return val_loss
+        return metrics
 
     def edit_distance(self, a, b):
         prev = list(range(len(b) + 1))
@@ -151,22 +169,25 @@ class Trainer:
             prev = cur
         return prev[-1]
 
-    def fit(self):
+    def fit(self, t0):
 
         best_loss = float("inf")
         
         for epoch in range(self.start_epoch + 1, self.epochs + 1):
-            loss = self.train_epoch(epoch)
-            if (self.val_loader is not None):
-                val_loss = self.validate()
-            else:
-                val_loss = loss
+            stats = self.train_epoch(epoch, t0)
+    
+            metrics = self.validate()
+            val_loss = metrics.get("val_loss")
             
             improved = val_loss < best_loss
             if improved:
                 best_loss = val_loss
                 self.save(self.ckpt_path, epoch) 
-                
+            
+            
+            self.log.log(epoch=epoch, **stats, **metrics)
+            
+
             self.save(self.last_path, epoch) 
 
     def save(self, path, epoch):
@@ -196,8 +217,31 @@ class Trainer:
             self.start_epoch = checkpoint["epoch"]
         
         return checkpoint["epoch"]
+    
+class MetricLogger:
+    def __init__(self, run_dir, filename="metrics.jsonl", config=None):
+        self.dir = Path(run_dir)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.path = self.dir / filename
+        if config is not None:   # write the settings once, next to the metrics
+            (self.dir / "config.json").write_text(
+                json.dumps(config, ensure_ascii=False, indent=1), encoding="utf-8")
 
-MODELS = {"cnn": CNN}
+    def log(self, **metrics):
+        metrics["time"] = time.time()
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(metrics, ensure_ascii=False) + "\n")
+
+MODELS = {"cnn": CNN, "transformer": Transformer}
+
+def make_run_name(args, hours=None, tag=None):
+    parts = [args.model]
+    parts.append(f"overfit{args.overfit}" if args.overfit else f"{hours:g}h")
+    parts += [f"lr{args.lr:g}", f"bs{args.bs}", f"ep{args.epochs}"]
+    if tag:
+        parts.append(tag)                         
+    parts.append(datetime.now().strftime("%m%d-%H%M"))
+    return "_".join(parts)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -206,14 +250,19 @@ def main():
     ap.add_argument("--bs", type=int, default=16) # batch size
     ap.add_argument("--lr", type=float, default=1e-3) # learning rate
     ap.add_argument("--overfit", type=int, default=0, help="train+eval on N utts")
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--device", type=str, default="cpu")
+    ap.add_argument("--run-name", type=str, default=None)
+    ap.add_argument("--tag", type=str, default=None)
+    ap.add_argument("--resume-path", type=str, default=None)
     args = ap.parse_args()
     
     featurizer = LogMelFeaturizer()
     train_ds = CzechSpeechDS("train", featurizer)
     val_ds   = CzechSpeechDS("validation", featurizer)
     vocab = train_ds.vocab  
+    
+    hours = sum(r["dur"] for r in train_ds.samples) / 3600
     
     if args.overfit:
         idx = random.Random(0).sample(range(len(train_ds)), args.overfit)
@@ -229,9 +278,18 @@ def main():
     device = args.device
     model = MODELS[args.model](vocab)
     
-    trainer = Trainer(model, vocab, args.epochs, args.lr, train_loader, val_loader=val_loader, device = device)
     
-    trainer.fit() 
+    resuming = args.resume_path is not None
+    run_name = (Path(args.resume_path).parent.name if resuming
+            else args.run_name or make_run_name(args, hours, args.tag))
+
+    trainer = Trainer(model, vocab, args.epochs, args.lr, train_loader, run_name, val_loader,  device = device)
+    if args.resume_path is not None:
+        done = trainer.load(args.resume_path, True)
+        print(f"resumed after epoch {done}")
+        
+    t0 = time.time()
+    trainer.fit(t0) 
     
 
 if __name__ == "__main__":
